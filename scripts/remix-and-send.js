@@ -22,7 +22,7 @@ const PROMPTS   = 'https://raw.githubusercontent.com/zarazhangrui/follow-builder
 
 const LLM_BASE    = process.env.LLM_BASE_URL || 'https://open.bigmodel.cn/api/coding/paas/v4';
 const LLM_KEY     = process.env.LLM_API_KEY;
-const LLM_MODEL   = process.env.LLM_MODEL || 'glm-4.6';
+const LLM_MODEL   = process.env.LLM_MODEL || 'glm-5-turbo';
 const LLM_TOKENS  = Number(process.env.LLM_MAX_TOKENS || 8192);
 const LANGUAGE    = process.env.DIGEST_LANGUAGE || 'zh';          // zh / en / bilingual
 const PREFERENCE  = (process.env.DIGEST_PREFERENCE || '').trim(); // 自然语言偏好
