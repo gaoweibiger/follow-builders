@@ -1,0 +1,30 @@
+name: Daily Digest to Feishu
+
+on:
+  schedule:
+    # GitHub cron 用 UTC。北京时间 08:00 = UTC 00:00
+    # 想拿"当天最新"feed（原作者每天 UTC 06:00 更新），改成 '30 7 * * *'（北京 15:30）
+    - cron: '0 0 * * *'
+  workflow_dispatch: {}   # 支持在 Actions 页面手动点按钮测试
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Remix and send
+        env:
+          LLM_API_KEY:       ${{ secrets.LLM_API_KEY }}
+          LLM_MODEL:         ${{ secrets.LLM_MODEL }}
+          LLM_MAX_TOKENS:    ${{ secrets.LLM_MAX_TOKENS }}
+          DIGEST_LANGUAGE:   ${{ secrets.DIGEST_LANGUAGE }}
+          DIGEST_PREFERENCE: ${{ secrets.DIGEST_PREFERENCE }}
+          FEISHU_APP_ID:     ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          FEISHU_OPEN_ID:    ${{ secrets.FEISHU_OPEN_ID }}
+        run: node scripts/remix-and-send.js
