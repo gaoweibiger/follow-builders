@@ -1,25 +1,22 @@
 #!/usr/bin/env node
 // ============================================================================
-// follow-builders: 拉取 feed → 调智谱 GLM 生成摘要 → 飞书交互式卡片推送
+// follow-builders + AI HOT 综合日报
+//   拉取 builder feed + aihot 资讯 → 智谱 GLM 生成综合日报 → 飞书交互式卡片
 // 零依赖：仅使用 Node 20+ 内置 fetch
-//
-// 环境变量（来自 GitHub Secrets，见 .github/workflows/feishu-digest.yml）：
-//   LLM_API_KEY        智谱 API Key（必填）
-//   LLM_MODEL          模型 ID，默认 glm-5
-//   LLM_MAX_TOKENS     输出上限，默认 8192（想要更详细可调到 12000~16000）
-//   DIGEST_LANGUAGE    zh / en / bilingual，默认 zh
-//   DIGEST_PREFERENCE  推送偏好（自然语言），如"把摘要写得更详细一些"
-//   FEISHU_APP_ID      飞书 App ID（必填）
-//   FEISHU_APP_SECRET  飞书 App Secret（必填）
-//   FEISHU_OPEN_ID     收件人 open_id，ou_ 开头（必填）
 // ============================================================================
 
-// ======================== 配置 ========================
+// ======================== 内容源 ========================
 const FEED_X    = 'https://raw.githubusercontent.com/zarazhangrui/follow-builders/main/feed-x.json';
 const FEED_POD  = 'https://raw.githubusercontent.com/zarazhangrui/follow-builders/main/feed-podcasts.json';
 const FEED_BLOG = 'https://raw.githubusercontent.com/zarazhangrui/follow-builders/main/feed-blogs.json';
 const PROMPTS   = 'https://raw.githubusercontent.com/zarazhangrui/follow-builders/main/prompts';
 
+// AI HOT 公开只读 API（合并的第二个内容源，无需 key）
+const INCLUDE_AIHOT = (process.env.INCLUDE_AIHOT ?? 'true') !== 'false'; // 默认开启
+const AIHOT_UA   = 'aihot-skill/0.3.6 (+https://aihot.virxact.com/aihot-skill/)';
+const AIHOT_BASE = 'https://aihot.virxact.com/api/public';
+
+// ======================== LLM / 飞书 配置 ========================
 const LLM_BASE    = process.env.LLM_BASE_URL || 'https://open.bigmodel.cn/api/coding/paas/v4';
 const LLM_KEY     = process.env.LLM_API_KEY;
 const LLM_MODEL   = process.env.LLM_MODEL || 'glm-5-turbo';
@@ -31,14 +28,15 @@ const FEISHU_APP_ID     = process.env.FEISHU_APP_ID;
 const FEISHU_APP_SECRET = process.env.FEISHU_APP_SECRET;
 const FEISHU_OPEN_ID    = process.env.FEISHU_OPEN_ID;
 
-const CARD_MAX_CHARS  = 26000; // 单张卡片累计字符上限（保守，飞书单卡约 30KB）
+const CARD_MAX_CHARS  = 26000; // 单张卡片累计字符上限
 const BLOCK_MAX_CHARS = 28000; // 单个 div 内容上限
 
 // ======================== 工具 ========================
-const j = u => fetch(u).then(r => (r.ok ? r.json() : null));
-const t = u => fetch(u).then(r => (r.ok ? r.text() : ''));
+const j  = u => fetch(u).then(r => (r.ok ? r.json() : null));
+const t  = u => fetch(u).then(r => (r.ok ? r.text() : ''));
+const ja = (u, h) => fetch(u, { headers: h }).then(r => (r.ok ? r.json() : null));
 
-// 裁剪 feed，控制输入 token 量（避免撞智谱 TPM 限流，同时更快更省）
+// ---- 裁剪 builder feed，控制输入 token ----
 const TRUNC = { transcript: 9000, tweetText: 600, blogContent: 4000 };
 function trimFeed(feedX, feedPod, feedBlog) {
   const x = (feedX?.x || []).map(b => ({
@@ -61,10 +59,22 @@ function trimFeed(feedX, feedPod, feedBlog) {
   return { x, podcasts, blogs };
 }
 
+// ---- 裁剪 aihot 资讯 ----
+function trimAihot(aihot) {
+  if (!aihot) return null;
+  return {
+    hot: (aihot.hot || []).slice(0, 5).map(h => ({
+      title: h.title, permalink: h.permalink, sourceCount: h.sourceCount,
+    })),
+    items: (aihot.items || []).slice(0, 12).map(it => ({
+      title: it.title, category: it.category, permalink: it.permalink,
+      summary: (it.summary || '').slice(0, 220),
+    })),
+  };
+}
+
 // ======================== 卡片构建 ========================
-// 把 Markdown 摘要拆成 lark_md 元素，并打包成多张卡片（超长自动分卡）
 function buildElements(md) {
-  // 优先按 Markdown 标题行拆，其次按空行段落拆
   const blocks = md
     .split(/\n(?=#{1,6}\s)|\n{2,}/)
     .map(s => s.trim())
@@ -73,7 +83,6 @@ function buildElements(md) {
   const elements = [];
   for (const b of blocks) {
     if (b.length > BLOCK_MAX_CHARS) {
-      // 单块过长则硬拆
       for (let i = 0; i < b.length; i += BLOCK_MAX_CHARS) {
         elements.push({ tag: 'div', text: { tag: 'lark_md', content: b.slice(i, i + BLOCK_MAX_CHARS) } });
       }
@@ -82,7 +91,6 @@ function buildElements(md) {
     }
     elements.push({ tag: 'hr' });
   }
-  // 去掉末尾多余的 hr
   while (elements.length && elements[elements.length - 1].tag === 'hr') elements.pop();
   return elements;
 }
@@ -113,14 +121,13 @@ function todayTitle() {
   const d = new Date().toLocaleDateString('zh-CN', {
     timeZone: 'Asia/Shanghai', year: 'numeric', month: 'long', day: 'numeric', weekday: 'long',
   });
-  return `🤖 AI Builders 每日摘要 · ${d}`;
+  return `🤖 AI 每日综合日报 · ${d}`;
 }
 
 // ======================== 主流程 ========================
 async function main() {
-  // 本地代理（Actions 无需）：Node 24 设 NODE_USE_ENV_PROXY=1 + HTTPS_PROXY 即可走代理
-  // 1. 拉取 feed + prompts（并行）
-  console.log('拉取 feed 与 prompts ...');
+  // 1. 拉取 builder feed + prompts（并行）
+  console.log('拉取 builder feed 与 prompts ...');
   const [feedX, feedPod, feedBlog, pDigest, pTweets, pPod, pTrans, pBlog] = await Promise.all([
     j(FEED_X), j(FEED_POD), j(FEED_BLOG),
     t(`${PROMPTS}/digest-intro.md`), t(`${PROMPTS}/summarize-tweets.md`),
@@ -128,17 +135,35 @@ async function main() {
     t(`${PROMPTS}/summarize-blogs.md`),
   ]);
 
-  const hasX    = !!(feedX?.x?.length);
-  const hasPod  = !!(feedPod?.podcasts?.length);
-  const hasBlog = !!(feedBlog?.blogs?.length || feedBlog?.articles?.length || (Array.isArray(feedBlog) && feedBlog.length));
-  if (!hasX && !hasPod && !hasBlog) {
-    console.log('今天没有新内容，跳过');
+  // 2. 拉取 AI HOT 资讯（可选，带指定 UA）
+  let aihotRaw = null;
+  if (INCLUDE_AIHOT) {
+    console.log('拉取 AI HOT 资讯 ...');
+    const since = new Date(Date.now() - 36 * 3600 * 1000).toISOString();
+    const [items, hot] = await Promise.all([
+      ja(`${AIHOT_BASE}/items?mode=selected&since=${since}&take=15`, { 'User-Agent': AIHOT_UA }),
+      ja(`${AIHOT_BASE}/hot-topics`, { 'User-Agent': AIHOT_UA }),
+    ]);
+    aihotRaw = { items: items?.items || [], hot: hot?.items || [] };
+    console.log(`AI HOT: ${aihotRaw.items.length} 条精选, ${aihotRaw.hot.length} 条热点`);
+  }
+
+  // 3. 裁剪
+  const trimmed = trimFeed(feedX, feedPod, feedBlog);
+  const trimmedAihot = trimAihot(aihotRaw);
+
+  const hasX    = !!trimmed.x.length;
+  const hasPod  = !!trimmed.podcasts.length;
+  const hasBlog = !!trimmed.blogs.length;
+  const hasAihot = !!(trimmedAihot?.items?.length || trimmedAihot?.hot?.length);
+  if (!hasX && !hasPod && !hasBlog && !hasAihot) {
+    console.log('今天没有任何内容，跳过');
     return;
   }
 
-  // 2. 拼接 system prompt
+  // 4. 拼接 system prompt
   const langRule = {
-    zh:        '整个摘要用中文输出（英文内容翻译成中文）。',
+    zh:        '整个日报用中文输出（英文内容翻译成中文）。',
     en:        'Output the entire digest in English.',
     bilingual: '每段先英文后中文，逐段交错。',
   }[LANGUAGE];
@@ -148,31 +173,43 @@ async function main() {
     '语言要求：' + langRule,
     '链接格式要求：所有来源链接一律用 Markdown 链接格式 `[文字](URL)`，确保在消息卡片中可点击。',
   ];
-  if (PREFERENCE) {
-    parts.push(`【用户偏好（必须严格遵守）】${PREFERENCE}`);
+  if (INCLUDE_AIHOT && hasAihot) {
+    parts.push(
+      '内容构成：本日报整合两类素材——' +
+      '「AI 行业资讯」（字段 aihot，来自 AI HOT 公开数据，已是中文，直接采用，保留来源标注）和 ' +
+      '「Builder 动态」（字段 x/podcasts/blogs，英文，需翻译）。' +
+      '请产出一份连贯的中文日报，建议结构：' +
+      '①「今日热点速览」用 aihot.hot 每条 1 句 + 链接；' +
+      '②「AI 行业动态」综合 aihot.items；' +
+      '③「Builder 观点」综合 x/podcasts/blogs。' +
+      '两类素材都要覆盖，不要遗漏任一类。'
+    );
   }
+  if (PREFERENCE) parts.push(`【用户偏好（必须严格遵守）】${PREFERENCE}`);
   const system = parts.filter(Boolean).join('\n\n');
 
-  const trimmed = trimFeed(feedX, feedPod, feedBlog);
   const content = JSON.stringify({
     generatedAt: feedX?.generatedAt,
-    note: 'transcript/content 已截断以控制篇幅，请基于以上内容总结核心观点',
+    note: '内容已截断以控制篇幅，请基于以上内容总结核心观点',
     stats: {
       xBuilders: trimmed.x.length,
       podcastEpisodes: trimmed.podcasts.length,
       blogPosts: trimmed.blogs.length,
+      aihotItems: trimmedAihot?.items?.length || 0,
+      aihotHot: trimmedAihot?.hot?.length || 0,
     },
     ...trimmed,
+    aihot: trimmedAihot,
   });
-  console.log(`输入裁剪后约 ${content.length} 字符`);
+  console.log(`输入约 ${content.length} 字符`);
 
-  // 3. 调智谱 GLM（OpenAI 兼容接口，429/5xx 自动退避重试）
-  console.log(`调用智谱 ${LLM_MODEL} 生成摘要 ...`);
+  // 5. 调智谱 GLM（429/5xx 自动退避重试）
+  console.log(`调用智谱 ${LLM_MODEL} 生成综合日报 ...`);
   const llmBody = JSON.stringify({
     model: LLM_MODEL,
     messages: [
       { role: 'system', content: system },
-      { role: 'user', content: `根据以下原始内容(JSON)生成今日 digest。每条内容必须带原始 url，禁止编造：\n\n${content}` },
+      { role: 'user', content: `根据以下原始内容(JSON)生成今日综合日报。每条内容必须带原始链接，禁止编造：\n\n${content}` },
     ],
     temperature: 0.7,
     max_tokens: LLM_TOKENS,
@@ -190,7 +227,7 @@ async function main() {
     }
     const errBody = await resp.text();
     if ((resp.status === 429 || resp.status >= 500) && attempt < 4) {
-      const wait = attempt * 10; // 10s, 20s, 30s
+      const wait = attempt * 10;
       console.log(`LLM 返回 ${resp.status}（第 ${attempt}/3 次重试），${wait}s 后重试 ...`);
       await new Promise(r => setTimeout(r, wait * 1000));
       continue;
@@ -198,14 +235,14 @@ async function main() {
     throw new Error(`LLM 调用失败 ${resp.status}: ${errBody}`);
   }
   if (!digest) throw new Error('LLM 返回为空');
-  console.log(`digest 已生成，长度 ${digest.length} 字符`);
+  console.log(`日报已生成，长度 ${digest.length} 字符`);
 
-  // 4. 构建飞书卡片
+  // 6. 构建飞书卡片
   const elements = buildElements(digest);
   const cards = packCards(elements, todayTitle());
   console.log(`构建 ${cards.length} 张卡片`);
 
-  // 5. 发飞书：换取 tenant_access_token
+  // 7. 发飞书：换取 tenant_access_token
   console.log('获取飞书 token ...');
   const tokenRes = await fetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
     method: 'POST',
@@ -214,7 +251,7 @@ async function main() {
   }).then(r => r.json());
   if (tokenRes.code !== 0) throw new Error(`飞书 token 失败: ${tokenRes.msg}`);
 
-  // 6. 逐张发送交互式卡片到个人（receive_id_type=open_id）
+  // 8. 逐张发送交互式卡片到个人
   for (let i = 0; i < cards.length; i++) {
     const sendRes = await fetch('https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id', {
       method: 'POST',
@@ -227,7 +264,7 @@ async function main() {
     }).then(r => r.json());
     if (sendRes.code !== 0) throw new Error(`飞书发送第 ${i + 1} 张卡片失败: ${sendRes.msg}`);
     console.log(`  ✅ 卡片 ${i + 1}/${cards.length} 已发送`);
-    if (i < cards.length - 1) await new Promise(r => setTimeout(r, 300)); // 避免限流
+    if (i < cards.length - 1) await new Promise(r => setTimeout(r, 300));
   }
   console.log('🎉 全部发送完成');
 }

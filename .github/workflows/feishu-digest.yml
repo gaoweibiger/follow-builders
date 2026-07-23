@@ -25,6 +25,7 @@ jobs:
           LLM_MAX_TOKENS:    ${{ secrets.LLM_MAX_TOKENS }}
           DIGEST_LANGUAGE:   ${{ secrets.DIGEST_LANGUAGE }}
           DIGEST_PREFERENCE: ${{ secrets.DIGEST_PREFERENCE }}
+          INCLUDE_AIHOT:     ${{ secrets.INCLUDE_AIHOT }}
           FEISHU_APP_ID:     ${{ secrets.FEISHU_APP_ID }}
           FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
           FEISHU_OPEN_ID:    ${{ secrets.FEISHU_OPEN_ID }}
