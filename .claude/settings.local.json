@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(gh workflow:*)",
-      "Bash(where curl:*)",
-      "Bash(gh auth:*)"
-    ]
-  }
-}
