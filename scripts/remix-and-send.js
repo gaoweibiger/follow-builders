@@ -20,9 +20,9 @@ const FEED_POD  = 'https://raw.githubusercontent.com/zarazhangrui/follow-builder
 const FEED_BLOG = 'https://raw.githubusercontent.com/zarazhangrui/follow-builders/main/feed-blogs.json';
 const PROMPTS   = 'https://raw.githubusercontent.com/zarazhangrui/follow-builders/main/prompts';
 
-const LLM_BASE    = process.env.LLM_BASE_URL || 'https://open.bigmodel.cn/api/paas/v4';
+const LLM_BASE    = process.env.LLM_BASE_URL || 'https://open.bigmodel.cn/api/coding/paas/v4';
 const LLM_KEY     = process.env.LLM_API_KEY;
-const LLM_MODEL   = process.env.LLM_MODEL || 'glm-5';
+const LLM_MODEL   = process.env.LLM_MODEL || 'glm-4.6';
 const LLM_TOKENS  = Number(process.env.LLM_MAX_TOKENS || 8192);
 const LANGUAGE    = process.env.DIGEST_LANGUAGE || 'zh';          // zh / en / bilingual
 const PREFERENCE  = (process.env.DIGEST_PREFERENCE || '').trim(); // 自然语言偏好
@@ -37,6 +37,29 @@ const BLOCK_MAX_CHARS = 28000; // 单个 div 内容上限
 // ======================== 工具 ========================
 const j = u => fetch(u).then(r => (r.ok ? r.json() : null));
 const t = u => fetch(u).then(r => (r.ok ? r.text() : ''));
+
+// 裁剪 feed，控制输入 token 量（避免撞智谱 TPM 限流，同时更快更省）
+const TRUNC = { transcript: 9000, tweetText: 600, blogContent: 4000 };
+function trimFeed(feedX, feedPod, feedBlog) {
+  const x = (feedX?.x || []).map(b => ({
+    name: b.name, handle: b.handle, bio: b.bio,
+    tweets: (b.tweets || []).map(tw => ({
+      url: tw.url, createdAt: tw.createdAt,
+      text: (tw.text || '').slice(0, TRUNC.tweetText),
+    })),
+  }));
+  const podcasts = (feedPod?.podcasts || []).map(p => ({
+    name: p.name, title: p.title, url: p.url,
+    transcript: (p.transcript || '').slice(0, TRUNC.transcript),
+  }));
+  const blogArr = feedBlog?.blogs || feedBlog?.articles || (Array.isArray(feedBlog) ? feedBlog : []);
+  const blogs = blogArr.map(b => ({
+    name: b.name, title: b.title, url: b.url, author: b.author,
+    description: b.description,
+    content: (b.content || '').slice(0, TRUNC.blogContent),
+  }));
+  return { x, podcasts, blogs };
+}
 
 // ======================== 卡片构建 ========================
 // 把 Markdown 摘要拆成 lark_md 元素，并打包成多张卡片（超长自动分卡）
@@ -95,6 +118,7 @@ function todayTitle() {
 
 // ======================== 主流程 ========================
 async function main() {
+  // 本地代理（Actions 无需）：Node 24 设 NODE_USE_ENV_PROXY=1 + HTTPS_PROXY 即可走代理
   // 1. 拉取 feed + prompts（并行）
   console.log('拉取 feed 与 prompts ...');
   const [feedX, feedPod, feedBlog, pDigest, pTweets, pPod, pTrans, pBlog] = await Promise.all([
@@ -129,34 +153,50 @@ async function main() {
   }
   const system = parts.filter(Boolean).join('\n\n');
 
+  const trimmed = trimFeed(feedX, feedPod, feedBlog);
   const content = JSON.stringify({
     generatedAt: feedX?.generatedAt,
+    note: 'transcript/content 已截断以控制篇幅，请基于以上内容总结核心观点',
     stats: {
-      xBuilders: feedX?.x?.length || 0,
-      podcastEpisodes: feedPod?.podcasts?.length || 0,
+      xBuilders: trimmed.x.length,
+      podcastEpisodes: trimmed.podcasts.length,
+      blogPosts: trimmed.blogs.length,
     },
-    x: feedX?.x,
-    podcasts: feedPod?.podcasts,
-    blogs: feedBlog?.blogs ?? feedBlog?.articles ?? feedBlog ?? [],
+    ...trimmed,
   });
+  console.log(`输入裁剪后约 ${content.length} 字符`);
 
-  // 3. 调智谱 GLM（OpenAI 兼容接口）
+  // 3. 调智谱 GLM（OpenAI 兼容接口，429/5xx 自动退避重试）
   console.log(`调用智谱 ${LLM_MODEL} 生成摘要 ...`);
-  const resp = await fetch(`${LLM_BASE}/chat/completions`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${LLM_KEY}` },
-    body: JSON.stringify({
-      model: LLM_MODEL,
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user', content: `根据以下原始内容(JSON)生成今日 digest。每条内容必须带原始 url，禁止编造：\n\n${content}` },
-      ],
-      temperature: 0.7,
-      max_tokens: LLM_TOKENS,
-    }),
+  const llmBody = JSON.stringify({
+    model: LLM_MODEL,
+    messages: [
+      { role: 'system', content: system },
+      { role: 'user', content: `根据以下原始内容(JSON)生成今日 digest。每条内容必须带原始 url，禁止编造：\n\n${content}` },
+    ],
+    temperature: 0.7,
+    max_tokens: LLM_TOKENS,
   });
-  if (!resp.ok) throw new Error(`LLM 调用失败 ${resp.status}: ${await resp.text()}`);
-  const digest = (await resp.json()).choices?.[0]?.message?.content?.trim();
+  let digest = '';
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    const resp = await fetch(`${LLM_BASE}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${LLM_KEY}` },
+      body: llmBody,
+    });
+    if (resp.ok) {
+      digest = ((await resp.json()).choices?.[0]?.message?.content || '').trim();
+      break;
+    }
+    const errBody = await resp.text();
+    if ((resp.status === 429 || resp.status >= 500) && attempt < 4) {
+      const wait = attempt * 10; // 10s, 20s, 30s
+      console.log(`LLM 返回 ${resp.status}（第 ${attempt}/3 次重试），${wait}s 后重试 ...`);
+      await new Promise(r => setTimeout(r, wait * 1000));
+      continue;
+    }
+    throw new Error(`LLM 调用失败 ${resp.status}: ${errBody}`);
+  }
   if (!digest) throw new Error('LLM 返回为空');
   console.log(`digest 已生成，长度 ${digest.length} 字符`);
 

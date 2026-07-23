@@ -20,6 +20,7 @@ jobs:
       - name: Remix and send
         env:
           LLM_API_KEY:       ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL:      ${{ secrets.LLM_BASE_URL }}
           LLM_MODEL:         ${{ secrets.LLM_MODEL }}
           LLM_MAX_TOKENS:    ${{ secrets.LLM_MAX_TOKENS }}
           DIGEST_LANGUAGE:   ${{ secrets.DIGEST_LANGUAGE }}
