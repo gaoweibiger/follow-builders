@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 // ============================================================================
 // follow-builders + AI HOT 综合日报
-//   拉取 builder feed + aihot 资讯 → 智谱 GLM 生成综合日报 → 飞书交互式卡片
+//   拉取 builder feed + aihot 资讯 → 智谱 GLM 生成综合日报 → 飞书纯文本消息
 // 零依赖：仅使用 Node 20+ 内置 fetch
+//   说明：改用 msg_type=text 纯文本（原 follow-builders 标准格式），飞书会自动把裸 URL
+//         识别成可点击链接——避开交互式卡片对 markdown 解析不全导致格式不显示的问题。
 // ============================================================================
 
 // ======================== 内容源 ========================
@@ -13,7 +15,8 @@ const PROMPTS   = 'https://raw.githubusercontent.com/zarazhangrui/follow-builder
 
 // AI HOT 公开只读 API（合并的第二个内容源，无需 key）
 const INCLUDE_AIHOT = (process.env.INCLUDE_AIHOT ?? 'true') !== 'false'; // 默认开启
-const AIHOT_UA   = 'aihot-skill/0.3.6 (+https://aihot.virxact.com/aihot-skill/)';
+// aihot /api/public/* 走 nginx UA 黑名单挡爬虫，必须带「浏览器 UA + aihot-skill 标识」，否则 403
+const AIHOT_UA   = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 aihot-skill/0.3.6';
 const AIHOT_BASE = 'https://aihot.virxact.com/api/public';
 
 // ======================== LLM / 飞书 配置 ========================
@@ -28,8 +31,7 @@ const FEISHU_APP_ID     = process.env.FEISHU_APP_ID;
 const FEISHU_APP_SECRET = process.env.FEISHU_APP_SECRET;
 const FEISHU_OPEN_ID    = process.env.FEISHU_OPEN_ID;
 
-const CARD_MAX_CHARS  = 26000; // 单张卡片累计字符上限
-const BLOCK_MAX_CHARS = 28000; // 单个 div 内容上限
+const TEXT_MAX_BYTES = 30000; // 飞书单条文本消息上限 30720 字节，按 UTF-8 字节留余量分条
 
 // ======================== 工具 ========================
 const j  = u => fetch(u).then(r => (r.ok ? r.json() : null));
@@ -73,48 +75,35 @@ function trimAihot(aihot) {
   };
 }
 
-// ======================== 卡片构建 ========================
-function buildElements(md) {
-  const blocks = md
-    .split(/\n(?=#{1,6}\s)|\n{2,}/)
-    .map(s => s.trim())
-    .filter(Boolean);
-
-  const elements = [];
-  for (const b of blocks) {
-    if (b.length > BLOCK_MAX_CHARS) {
-      for (let i = 0; i < b.length; i += BLOCK_MAX_CHARS) {
-        elements.push({ tag: 'div', text: { tag: 'lark_md', content: b.slice(i, i + BLOCK_MAX_CHARS) } });
+// ======================== 文本分条 ========================
+// 原 follow-builders 标准格式：直接发 msg_type=text 纯文本。
+// 飞书会自动把裸 URL 识别成可点击链接，无需卡片/markdown 解析。
+// 仅当内容超过单条消息字节上限（30720B）时，按段落切分成多条发送。
+const utf8Bytes = s => Buffer.byteLength(s, 'utf8');
+function splitText(text, maxBytes) {
+  if (utf8Bytes(text) <= maxBytes) return [text];
+  const chunks = [];
+  let cur = '';
+  for (const para of text.split(/\n{2,}/)) {
+    const piece = (cur ? cur + '\n\n' : '') + para;
+    if (utf8Bytes(piece) > maxBytes) {
+      if (cur) { chunks.push(cur); cur = ''; }
+      if (utf8Bytes(para) <= maxBytes) {
+        cur = para;
+      } else { // 单段超长，按字符逐步累加到字节上限
+        let buf = '';
+        for (const ch of para) {
+          if (utf8Bytes(buf + ch) > maxBytes) { chunks.push(buf); buf = ch; }
+          else buf += ch;
+        }
+        if (buf) cur = buf;
       }
     } else {
-      elements.push({ tag: 'div', text: { tag: 'lark_md', content: b } });
+      cur = piece;
     }
-    elements.push({ tag: 'hr' });
   }
-  while (elements.length && elements[elements.length - 1].tag === 'hr') elements.pop();
-  return elements;
-}
-
-function packCards(elements, title) {
-  const cards = [];
-  let cur = [], curLen = 0;
-  for (const el of elements) {
-    const elLen = (el.text?.content?.length || 0) + 40;
-    if (curLen + elLen > CARD_MAX_CHARS && cur.length) {
-      cards.push(cur); cur = []; curLen = 0;
-    }
-    cur.push(el); curLen += elLen;
-  }
-  if (cur.length) cards.push(cur);
-
-  return cards.map((els, i) => ({
-    config: { wide_screen_mode: true },
-    header: {
-      title: { tag: 'plain_text', content: i === 0 ? title : `${title}（续 ${i + 1}）` },
-      template: 'blue',
-    },
-    elements: els,
-  }));
+  if (cur) chunks.push(cur);
+  return chunks;
 }
 
 function todayTitle() {
@@ -171,7 +160,13 @@ async function main() {
   const parts = [
     pDigest, pTweets, pPod, pTrans, pBlog,
     '语言要求：' + langRule,
-    '链接格式要求：所有来源链接一律用 Markdown 链接格式 `[文字](URL)`，确保在消息卡片中可点击。',
+    '输出格式要求（必须严格遵守，用于飞书纯文本消息）：'
+    + '① 整篇用纯文本输出，禁止任何 Markdown 符号——不要 # 标题、不要 **加粗**、不要 *斜体*、不要 [文字](URL)、不要反引号；'
+    + '② 章节标题用全大写字母或 emoji 单独成行（例如「X / TWITTER」「OFFICIAL BLOGS」「PODCASTS」「🤖 AI 行业动态」「🔥 今日热点」）；'
+    + '③ 要点一律用「- 」开头逐行列出；'
+    + '④ 所有来源链接一律用裸 URL 单独成行（例如 https://x.com/levie/status/xxx 或 https://aihot.virxact.com/items/xxx），飞书纯文本消息会自动识别成可点击链接，绝不要用 [文字](URL) 包裹；'
+    + '⑤ 段落之间空一行，确保手机上可扫读；'
+    + '⑥ X/Twitter 作者不要带 @（写成「Aaron Levie (levie on X)」即可）。',
   ];
   if (INCLUDE_AIHOT && hasAihot) {
     parts.push(
@@ -237,10 +232,10 @@ async function main() {
   if (!digest) throw new Error('LLM 返回为空');
   console.log(`日报已生成，长度 ${digest.length} 字符`);
 
-  // 6. 构建飞书卡片
-  const elements = buildElements(digest);
-  const cards = packCards(elements, todayTitle());
-  console.log(`构建 ${cards.length} 张卡片`);
+  // 6. 按原 follow-builders 纯文本格式分条（飞书 msg_type=text）
+  const fullText = `${todayTitle()}\n\n${digest}`;
+  const chunks = splitText(fullText, TEXT_MAX_BYTES);
+  console.log(`构建 ${chunks.length} 条文本消息，共 ${utf8Bytes(fullText)} 字节`);
 
   // 7. 发飞书：换取 tenant_access_token
   console.log('获取飞书 token ...');
@@ -251,20 +246,20 @@ async function main() {
   }).then(r => r.json());
   if (tokenRes.code !== 0) throw new Error(`飞书 token 失败: ${tokenRes.msg}`);
 
-  // 8. 逐张发送交互式卡片到个人
-  for (let i = 0; i < cards.length; i++) {
+  // 8. 逐条发送纯文本消息到个人
+  for (let i = 0; i < chunks.length; i++) {
     const sendRes = await fetch('https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokenRes.tenant_access_token}` },
       body: JSON.stringify({
         receive_id: FEISHU_OPEN_ID,
-        msg_type: 'interactive',
-        content: JSON.stringify(cards[i]),
+        msg_type: 'text',
+        content: JSON.stringify({ text: chunks[i] }),
       }),
     }).then(r => r.json());
-    if (sendRes.code !== 0) throw new Error(`飞书发送第 ${i + 1} 张卡片失败: ${sendRes.msg}`);
-    console.log(`  ✅ 卡片 ${i + 1}/${cards.length} 已发送`);
-    if (i < cards.length - 1) await new Promise(r => setTimeout(r, 300));
+    if (sendRes.code !== 0) throw new Error(`飞书发送第 ${i + 1} 条文本失败: ${sendRes.msg}`);
+    console.log(`  ✅ 文本 ${i + 1}/${chunks.length} 已发送`);
+    if (i < chunks.length - 1) await new Promise(r => setTimeout(r, 300));
   }
   console.log('🎉 全部发送完成');
 }
