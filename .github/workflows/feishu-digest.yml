@@ -2,9 +2,9 @@ name: Daily Digest to Feishu
 
 on:
   schedule:
-    # GitHub cron 用 UTC。北京时间 08:00 = UTC 00:00
-    # 想拿"当天最新"feed（原作者每天 UTC 06:00 更新），改成 '30 7 * * *'（北京 15:30）
-    - cron: '0 0 * * *'
+    # ⚠️ 临时近时验证：cron 设为 UTC 01:25（北京 09:25），用于确认 schedule 触发器是否真的生效。
+    #    验证通过后立即改回 '13 16 * * *'（UTC 16:13 = 北京 00:13，半夜推送，避开整点拥堵）。
+    - cron: '25 1 * * *'
   workflow_dispatch: {}   # 支持在 Actions 页面手动点按钮测试
 
 jobs:
